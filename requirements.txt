@@ -1,0 +1,4 @@
+streamlit
+streamlit-autorefresh
+alpaca-py
+requests
