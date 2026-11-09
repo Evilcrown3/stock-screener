@@ -2,3 +2,5 @@ streamlit
 streamlit-autorefresh
 alpaca-py
 requests
+websockets
+rich
