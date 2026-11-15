@@ -83,3 +83,11 @@ def test_best_spread_picks_cheapest_ask_and_richest_bid_across_venues():
 def test_best_spread_needs_two_fresh_venues():
     now = time.time()
     assert cs.best_spread({"Coinbase": cs.Quote(1, 1.1, now)}, now) is None
+
+
+def test_coinbase_gets_longer_stale_window():
+    now = time.time()
+    qs = {"Coinbase": cs.Quote(100.0, 100.1, now - 60), "Kraken": cs.Quote(101.0, 101.1, now - 60)}
+    assert cs.is_stale("Kraken", qs["Kraken"], now)
+    assert not cs.is_stale("Coinbase", qs["Coinbase"], now)
+    assert cs.best_spread(qs, now) is None  # only Coinbase is fresh
