@@ -24,15 +24,24 @@ pip install -r requirements.txt
 export ETH_WS_URL="wss://eth-mainnet.g.alchemy.com/v2/YOUR_KEY"
 
 python crypto_screener.py              # live
-python crypto_screener.py --alert 0.3  # highlight + log spreads >= 0.3%
+python crypto_screener.py --size 5000  # net spread for a $5,000 trade (default $1,000)
+python crypto_screener.py --alert 0.1  # only highlight net spreads >= 0.1%
 python crypto_screener.py --no-uniswap # exchanges only
 python crypto_screener.py --demo       # fake prices, no network
 ```
 
-Spreads over the alert level are appended to `arb_alerts.csv` (turn off with `--no-log`).
+The table shows two spreads for the best route per coin:
 
-**Spreads are gross.** Exchange trading/withdrawal fees and Ethereum gas are not
-subtracted; the Uniswap pool fee is built into its bid/ask. A spread has to beat all of
-those costs to be a real opportunity.
+- **Gross**: sell venue's bid minus buy venue's ask. Uniswap's pool fee is already in its price.
+- **Net**: gross minus both exchanges' taker fees, minus live Ethereum gas for any Uniswap leg
+  (spread over `--size`). **Green = the trade would make money after costs.**
+
+Taker fees are entry-level tiers as of Nov 2026: Coinbase 0.90%, Kraken 0.80%, Bitstamp 0.40%,
+Binance.US 0.02%. **Edit `TAKER_FEE_PCT` at the top of `crypto_screener.py` to match your
+account.** Withdrawal/transfer fees are not included (it assumes you already hold funds on both
+venues).
+
+Net spreads at or above `--alert` (default 0 = any profit) are appended to `arb_alerts.csv`
+(turn off with `--no-log`).
 
 Tests: `python -m pytest tests`

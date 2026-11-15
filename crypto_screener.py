@@ -14,12 +14,16 @@ Run:
     export ETH_WS_URL="wss://eth-mainnet.g.alchemy.com/v2/YOUR_KEY"
     python crypto_screener.py
 
-    python crypto_screener.py --alert 0.3       # highlight spreads >= 0.3%
+    python crypto_screener.py --size 5000       # net spread for a $5,000 trade
+    python crypto_screener.py --alert 0.1       # highlight net spreads >= 0.1%
     python crypto_screener.py --no-uniswap      # exchanges only
     python crypto_screener.py --demo            # fake prices, no network
 
-Spreads are GROSS: exchange trading fees, withdrawal fees and gas are not
-subtracted. The Uniswap pool fee IS included in its bid/ask.
+Gross = sell venue's bid vs buy venue's ask (Uniswap's pool fee is built in).
+Net   = gross minus each exchange's taker fee (TAKER_FEE_PCT below) and, for a
+        Uniswap leg, live Ethereum gas for one swap spread over --size.
+Not included: withdrawal/transfer fees (assumes you already hold funds on both
+venues, which is how cross-exchange arbitrage is normally done).
 """
 
 import argparse
@@ -55,6 +59,21 @@ STALE_SECONDS = 30          # ignore a venue's quote if it hasn't updated in thi
 STALE_BY_VENUE = {"Coinbase": 120}
 REFRESH_PER_SECOND = 4      # terminal redraw rate
 LOG_EVERY_SECONDS = 10      # at most one log row per coin per this many seconds
+
+# Taker fee per trade, in percent, at each exchange's entry-level tier
+# (checked Nov 2026). EDIT these to match your own account's fee tier.
+# Uniswap is 0 here because its pool fee is already built into its bid/ask.
+TAKER_FEE_PCT = {
+    "Coinbase": 0.90,    # Coinbase Advanced, US, under $10k/month
+    "Kraken": 0.80,      # Kraken Pro, Tier 1
+    "Bitstamp": 0.40,    # under $10k/month
+    "Binance.US": 0.02,  # flat spot taker fee
+    "Uniswap": 0.0,
+}
+UNISWAP_SWAP_GAS = 150_000  # gas units for a typical Uniswap v3 single-pool swap
+GAS_TIP_GWEI = 0.1          # priority fee added on top of the block's base fee
+
+DEFAULT_SIZE_USD = 1000     # trade size used to turn gas ($) into a % cost
 
 # Exchange symbol for each coin
 COINBASE = {c: f"{c}-USD" for c in COINS}
@@ -109,6 +128,9 @@ class Quote:
 quotes = {c: {} for c in COINS}
 # status[venue] -> short text shown under the table
 status = {v: "starting" for v in VENUES}
+# Live Ethereum gas info from the Uniswap connection
+gas = {"base_fee_wei": 0, "eth_usd": 0.0}
+settings = {"size_usd": DEFAULT_SIZE_USD}
 
 
 def put(coin, venue, bid, ask):
@@ -267,6 +289,8 @@ def pool_price_in_quote(pool, sqrt_price_x96):
 def publish_uniswap(pools):
     """Turn pool prices into USD quotes. WETH-quoted pools use Uniswap's own ETH/USDC price."""
     eth_usd = next((p.price_in_quote for p in pools if p.coin == "ETH"), 0.0)
+    if eth_usd:
+        gas["eth_usd"] = eth_usd
     for p in pools:
         if not p.price_in_quote:
             continue
@@ -336,14 +360,25 @@ async def run_uniswap(ws_url):
                 for p in pools:
                     await load_pool(rpc, p)
                 publish_uniswap(pools)
-                await rpc.call("eth_subscribe", ["logs", {"address": list(by_address), "topics": [SWAP_TOPIC]}])
+                block = await rpc.call("eth_getBlockByNumber", ["latest", False])
+                gas["base_fee_wei"] = int(block.get("baseFeePerGas", "0x0"), 16)
+                swaps_sub = await rpc.call("eth_subscribe", ["logs", {"address": list(by_address), "topics": [SWAP_TOPIC]}])
+                heads_sub = await rpc.call("eth_subscribe", ["newHeads"])
                 status["Uniswap"] = "live"
                 backoff = 1
                 async for raw in ws:
                     msg = json.loads(raw)
-                    log = msg.get("params", {}).get("result")
-                    if not isinstance(log, dict) or log.get("removed"):
+                    params = msg.get("params", {})
+                    result = params.get("result")
+                    if not isinstance(result, dict):
                         continue
+                    if params.get("subscription") == heads_sub:
+                        if result.get("baseFeePerGas"):
+                            gas["base_fee_wei"] = int(result["baseFeePerGas"], 16)
+                        continue
+                    if params.get("subscription") != swaps_sub or result.get("removed"):
+                        continue
+                    log = result
                     pool = by_address.get(log.get("address", "").lower())
                     if pool:
                         pool.price_in_quote = pool_price_in_quote(pool, decode_swap_sqrt_price(log["data"]))
@@ -367,10 +402,29 @@ def is_stale(venue, quote, now):
     return now - quote.ts > STALE_BY_VENUE.get(venue, STALE_SECONDS)
 
 
+def uniswap_gas_usd():
+    """Dollar cost of one Uniswap swap at the current base fee (0 if unknown)."""
+    if not gas["base_fee_wei"] or not gas["eth_usd"]:
+        return 0.0
+    wei = (gas["base_fee_wei"] + GAS_TIP_GWEI * 1e9) * UNISWAP_SWAP_GAS
+    return wei / 1e18 * gas["eth_usd"]
+
+
+def net_pct(buy_v, sell_v, gross_pct, size_usd=None):
+    """Gross spread minus both taker fees and Uniswap gas (as % of trade size)."""
+    size_usd = size_usd or settings["size_usd"]
+    net = gross_pct - TAKER_FEE_PCT.get(buy_v, 0) - TAKER_FEE_PCT.get(sell_v, 0)
+    for leg in (buy_v, sell_v):
+        if leg == "Uniswap":
+            net -= uniswap_gas_usd() / size_usd * 100
+    return net
+
+
 def best_spread(coin_quotes, now=None):
     """
-    Best "buy on A at A's ask, sell on B at B's bid" across different venues.
-    Returns (buy_venue, sell_venue, buy_price, sell_price, spread_pct) or None.
+    Best "buy on A at A's ask, sell on B at B's bid" across different venues,
+    ranked by NET spread (after fees and gas).
+    Returns (buy_venue, sell_venue, buy_price, sell_price, gross_pct, net_pct) or None.
     """
     now = now or time.time()
     fresh = {v: q for v, q in coin_quotes.items() if not is_stale(v, q, now)}
@@ -379,9 +433,10 @@ def best_spread(coin_quotes, now=None):
         for sell_v, sq in fresh.items():
             if buy_v == sell_v:
                 continue
-            pct = (sq.bid - bq.ask) / bq.ask * 100
-            if best is None or pct > best[4]:
-                best = (buy_v, sell_v, bq.ask, sq.bid, pct)
+            gross = (sq.bid - bq.ask) / bq.ask * 100
+            net = net_pct(buy_v, sell_v, gross)
+            if best is None or net > best[5]:
+                best = (buy_v, sell_v, bq.ask, sq.bid, gross, net)
     return best
 
 
@@ -392,6 +447,8 @@ def best_spread(coin_quotes, now=None):
 def fmt_price(x):
     if x >= 10000:
         return f"{x:,.0f}"
+    if x >= 1000:
+        return f"{x:,.1f}"
     if x >= 100:
         return f"{x:,.2f}"
     if x >= 1:
@@ -413,7 +470,8 @@ def build_view(alert_pct, venues):
     for v in venues:
         table.add_column(SHORT[v], justify="right", no_wrap=True)
     table.add_column("Buy→Sell", no_wrap=True)
-    table.add_column("Spread", justify="right", no_wrap=True)
+    table.add_column("Gross", justify="right", no_wrap=True)
+    table.add_column("Net", justify="right", no_wrap=True)
 
     for coin in COINS:
         row = [coin]
@@ -428,11 +486,13 @@ def build_view(alert_pct, venues):
                 row.append(fmt_price(q.mid))
         b = best_spread(cq, now)
         if b:
-            buy_v, sell_v, buy_p, sell_p, pct = b
-            style = "bold black on green" if pct >= alert_pct else ("green" if pct > 0 else "red")
-            row += [f"{CODE[buy_v]}→{CODE[sell_v]}", Text(f"{pct:+.2f}%", style=style)]
+            buy_v, sell_v, buy_p, sell_p, gross, net = b
+            style = "bold black on green" if net >= alert_pct else "red"
+            row += [f"{CODE[buy_v]}→{CODE[sell_v]}",
+                    Text(f"{gross:+.2f}%", style="green" if gross > 0 else "dim"),
+                    Text(f"{net:+.2f}%", style=style)]
         else:
-            row += [Text("need 2 venues", style="dim"), ""]
+            row += [Text("need 2 venues", style="dim"), "", ""]
         table.add_row(*row)
 
     status_line = Text()
@@ -440,9 +500,14 @@ def build_view(alert_pct, venues):
         s = status[v]
         status_line.append(f"{SHORT[v]}: ", style="bold")
         status_line.append(f"{s}  ", style="green" if s == "live" else "yellow")
-    footer = Text(f"Highlight at >= {alert_pct}% gross (buy at ask, sell at bid). Fees & gas not included. "
-                  "Struck-out = stale. CB=Coinbase KRK=Kraken BST=Bitstamp BIN=Binance.US UNI=Uniswap. Ctrl+C to quit.", style="dim")
-    return Group(table, status_line, footer)
+    g = uniswap_gas_usd()
+    gas_text = f"${g:,.2f}/swap" if g else "waiting"
+    fees = " ".join(f"{CODE[v]} {TAKER_FEE_PCT[v]:g}%" for v in venues if v != "Uniswap")
+    cost_line = Text(f"Trade size ${settings['size_usd']:,.0f} · Uniswap gas {gas_text} · Taker fees: {fees}",
+                     style="cyan")
+    footer = Text(f"Net = gross − taker fees − gas. Green when net ≥ {alert_pct}%. Struck-out = stale. "
+                  "CB=Coinbase KRK=Kraken BST=Bitstamp BIN=Binance.US UNI=Uniswap. Ctrl+C to quit.", style="dim")
+    return Group(table, status_line, cost_line, footer)
 
 
 class AlertLog:
@@ -451,7 +516,8 @@ class AlertLog:
         self.last = {}
         if path and not os.path.exists(path):
             with open(path, "w", newline="") as f:
-                csv.writer(f).writerow(["time", "coin", "buy_on", "buy_price", "sell_on", "sell_price", "spread_pct"])
+                csv.writer(f).writerow(["time", "coin", "buy_on", "buy_price", "sell_on", "sell_price",
+                                        "gross_pct", "net_pct", "size_usd"])
 
     def check(self, alert_pct):
         if not self.path:
@@ -459,11 +525,12 @@ class AlertLog:
         now = time.time()
         for coin in COINS:
             b = best_spread(quotes[coin], now)
-            if b and b[4] >= alert_pct and now - self.last.get(coin, 0) >= LOG_EVERY_SECONDS:
+            if b and b[5] >= alert_pct and now - self.last.get(coin, 0) >= LOG_EVERY_SECONDS:
                 self.last[coin] = now
                 with open(self.path, "a", newline="") as f:
                     csv.writer(f).writerow([datetime.now().isoformat(timespec="seconds"), coin,
-                                            b[0], b[2], b[1], b[3], round(b[4], 4)])
+                                            b[0], b[2], b[1], b[3], round(b[4], 4), round(b[5], 4),
+                                            settings["size_usd"]])
 
 
 # --------------------------------------------------------------------------
@@ -474,6 +541,7 @@ async def run_demo(venues):
     base = {"BTC": 90000, "ETH": 3200, "SOL": 160, "LINK": 18, "UNI": 9}
     for v in venues:
         status[v] = "live"
+    gas.update(base_fee_wei=int(2e9), eth_usd=3200.0)
     while True:
         for coin, px in base.items():
             base[coin] = px * (1 + random.gauss(0, 0.0005))
@@ -492,6 +560,7 @@ async def run_demo(venues):
 
 async def main(args):
     venues = [v for v in VENUES if not (args.no_uniswap and v == "Uniswap")]
+    settings["size_usd"] = args.size
     if args.demo:
         tasks = [run_demo(venues)]
     else:
@@ -520,9 +589,12 @@ async def main(args):
 
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(description="Live multi-exchange crypto arbitrage screener")
-    ap.add_argument("--alert", type=float, default=0.5, help="highlight/log spreads at or above this %% (default 0.5)")
+    ap.add_argument("--alert", type=float, default=0.0,
+                    help="highlight/log when the NET spread is at or above this %% (default 0.0 = any profit)")
+    ap.add_argument("--size", type=float, default=DEFAULT_SIZE_USD,
+                    help=f"trade size in USD used for the gas cost (default {DEFAULT_SIZE_USD})")
     ap.add_argument("--no-uniswap", action="store_true", help="skip the on-chain Uniswap feed")
-    ap.add_argument("--log", default="arb_alerts.csv", help="CSV file for spreads over the alert level")
+    ap.add_argument("--log", default="arb_alerts.csv", help="CSV file for net spreads over the alert level")
     ap.add_argument("--no-log", action="store_true", help="don't write the CSV log")
     ap.add_argument("--demo", action="store_true", help="fake prices, no network (test the display)")
     return ap.parse_args(argv)

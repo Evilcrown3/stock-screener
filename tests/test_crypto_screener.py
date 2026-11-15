@@ -75,9 +75,10 @@ def test_best_spread_picks_cheapest_ask_and_richest_bid_across_venues():
         "Kraken": cs.Quote(101.0, 101.1, now),
         "Bitstamp": cs.Quote(99.0, 99.2, now - 999),  # stale, ignored
     }
-    buy_v, sell_v, buy_p, sell_p, pct = cs.best_spread(qs, now)
+    buy_v, sell_v, buy_p, sell_p, pct, net = cs.best_spread(qs, now)
     assert (buy_v, sell_v, buy_p, sell_p) == ("Coinbase", "Kraken", 100.1, 101.0)
     assert abs(pct - (101.0 - 100.1) / 100.1 * 100) < 1e-12
+    assert abs(net - (pct - cs.TAKER_FEE_PCT["Coinbase"] - cs.TAKER_FEE_PCT["Kraken"])) < 1e-12
 
 
 def test_best_spread_needs_two_fresh_venues():
@@ -91,3 +92,33 @@ def test_coinbase_gets_longer_stale_window():
     assert cs.is_stale("Kraken", qs["Kraken"], now)
     assert not cs.is_stale("Coinbase", qs["Coinbase"], now)
     assert cs.best_spread(qs, now) is None  # only Coinbase is fresh
+
+
+def test_uniswap_gas_usd():
+    cs.gas.update(base_fee_wei=int(1.9e9), eth_usd=2000.0)  # 1.9 gwei base + 0.1 tip = 2 gwei
+    # 2 gwei * 150,000 gas = 0.0003 ETH = $0.60
+    assert abs(cs.uniswap_gas_usd() - 0.60) < 1e-9
+
+
+def test_net_pct_subtracts_fees_and_uniswap_gas():
+    cs.gas.update(base_fee_wei=int(1.9e9), eth_usd=2000.0)  # $0.60 per swap
+    # Buy on Uniswap (fee already in its price, but pays gas), sell on Binance.US (0.02%)
+    net = cs.net_pct("Uniswap", "Binance.US", 0.50, size_usd=1000)
+    assert abs(net - (0.50 - 0.02 - 0.06)) < 1e-9
+
+
+def test_best_spread_ranks_by_net_not_gross():
+    now = time.time()
+    cs.gas.update(base_fee_wei=0, eth_usd=0.0)
+    qs = {
+        # Coinbase->Kraken has the bigger gross gap but pays 0.90% + 0.80% in fees
+        "Coinbase": cs.Quote(99.9, 100.0, now),
+        "Kraken": cs.Quote(101.0, 101.1, now),
+        # Binance.US->Bitstamp: smaller gross gap, but only 0.02% + 0.40% in fees
+        "Binance.US": cs.Quote(99.9, 100.0, now),
+        "Bitstamp": cs.Quote(100.8, 100.9, now),
+    }
+    b = cs.best_spread(qs, now)
+    # Best gross is CB->KRK / BIN->KRK (+1.0%), but BIN->BST nets more: 0.8 - 0.02 - 0.40
+    assert (b[0], b[1]) == ("Binance.US", "Bitstamp")
+    assert abs(b[5] - 0.38) < 1e-9
