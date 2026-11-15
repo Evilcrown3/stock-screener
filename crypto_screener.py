@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 import websockets
+from rich import box
 from rich.console import Console, Group
 from rich.live import Live
 from rich.table import Table
@@ -49,6 +50,9 @@ COINS = ["BTC", "ETH", "SOL", "LINK", "UNI"]
 DEFAULT_ETH_WS_URL = "wss://ethereum-rpc.publicnode.com"
 
 STALE_SECONDS = 30          # ignore a venue's quote if it hasn't updated in this long
+# Coinbase's public ticker only updates on trades, so a quiet coin (e.g. LINK)
+# can go 30s+ with an unchanged, still-valid quote. Give it a longer window.
+STALE_BY_VENUE = {"Coinbase": 120}
 REFRESH_PER_SECOND = 4      # terminal redraw rate
 LOG_EVERY_SECONDS = 10      # at most one log row per coin per this many seconds
 
@@ -180,7 +184,8 @@ def coinbase_feed():
 def kraken_feed():
     return (
         "wss://ws.kraken.com/v2",
-        [{"method": "subscribe", "params": {"channel": "ticker", "symbol": list(KRAKEN.values())}}],
+        [{"method": "subscribe", "params": {"channel": "ticker", "symbol": list(KRAKEN.values()),
+                                                 "event_trigger": "bbo"}}],
         parse_kraken,
     )
 
@@ -358,13 +363,17 @@ async def run_uniswap(ws_url):
 # Spread calculation
 # --------------------------------------------------------------------------
 
-def best_spread(coin_quotes, now=None, stale=STALE_SECONDS):
+def is_stale(venue, quote, now):
+    return now - quote.ts > STALE_BY_VENUE.get(venue, STALE_SECONDS)
+
+
+def best_spread(coin_quotes, now=None):
     """
     Best "buy on A at A's ask, sell on B at B's bid" across different venues.
     Returns (buy_venue, sell_venue, buy_price, sell_price, spread_pct) or None.
     """
     now = now or time.time()
-    fresh = {v: q for v, q in coin_quotes.items() if now - q.ts <= stale}
+    fresh = {v: q for v, q in coin_quotes.items() if not is_stale(v, q, now)}
     best = None
     for buy_v, bq in fresh.items():
         for sell_v, sq in fresh.items():
@@ -381,23 +390,30 @@ def best_spread(coin_quotes, now=None, stale=STALE_SECONDS):
 # --------------------------------------------------------------------------
 
 def fmt_price(x):
-    if x >= 1000:
+    if x >= 10000:
+        return f"{x:,.0f}"
+    if x >= 100:
         return f"{x:,.2f}"
     if x >= 1:
         return f"{x:,.3f}"
     return f"{x:.5f}"
 
 
+# Short names keep the table narrow enough for a phone / Codespace terminal.
+SHORT = {"Coinbase": "Coinbase", "Kraken": "Kraken", "Bitstamp": "Bitstamp",
+         "Binance.US": "Binance", "Uniswap": "Uniswap"}
+CODE = {"Coinbase": "CB", "Kraken": "KRK", "Bitstamp": "BST", "Binance.US": "BIN", "Uniswap": "UNI"}
+
+
 def build_view(alert_pct, venues):
     now = time.time()
     table = Table(title=f"Crypto Arb Screener  ·  {datetime.now().strftime('%I:%M:%S %p')}",
-                  title_justify="left", expand=True)
-    table.add_column("Coin", style="bold")
+                  title_justify="left", box=box.SIMPLE_HEAD, pad_edge=False, collapse_padding=True)
+    table.add_column("Coin", style="bold", no_wrap=True)
     for v in venues:
-        table.add_column(v, justify="right")
-    table.add_column("Buy on", justify="left")
-    table.add_column("Sell on", justify="left")
-    table.add_column("Spread", justify="right")
+        table.add_column(SHORT[v], justify="right", no_wrap=True)
+    table.add_column("Buy→Sell", no_wrap=True)
+    table.add_column("Spread", justify="right", no_wrap=True)
 
     for coin in COINS:
         row = [coin]
@@ -406,7 +422,7 @@ def build_view(alert_pct, venues):
             q = cq.get(v)
             if not q:
                 row.append(Text("—", style="dim"))
-            elif now - q.ts > STALE_SECONDS:
+            elif is_stale(v, q, now):
                 row.append(Text(fmt_price(q.mid), style="dim strike"))
             else:
                 row.append(fmt_price(q.mid))
@@ -414,18 +430,18 @@ def build_view(alert_pct, venues):
         if b:
             buy_v, sell_v, buy_p, sell_p, pct = b
             style = "bold black on green" if pct >= alert_pct else ("green" if pct > 0 else "red")
-            row += [f"{buy_v} {fmt_price(buy_p)}", f"{sell_v} {fmt_price(sell_p)}", Text(f"{pct:+.3f}%", style=style)]
+            row += [f"{CODE[buy_v]}→{CODE[sell_v]}", Text(f"{pct:+.2f}%", style=style)]
         else:
-            row += ["", "", Text("need 2 venues", style="dim")]
+            row += [Text("need 2 venues", style="dim"), ""]
         table.add_row(*row)
 
     status_line = Text()
     for v in venues:
         s = status[v]
-        status_line.append(f"{v}: ", style="bold")
-        status_line.append(f"{s}   ", style="green" if s == "live" else "yellow")
-    footer = Text(f"Highlight at >= {alert_pct}% gross. Prices are bid/ask mids; spread uses ask to buy, bid to sell. "
-                  "Exchange fees & gas not included. Ctrl+C to quit.", style="dim")
+        status_line.append(f"{SHORT[v]}: ", style="bold")
+        status_line.append(f"{s}  ", style="green" if s == "live" else "yellow")
+    footer = Text(f"Highlight at >= {alert_pct}% gross (buy at ask, sell at bid). Fees & gas not included. "
+                  "Struck-out = stale. CB=Coinbase KRK=Kraken BST=Bitstamp BIN=Binance.US UNI=Uniswap. Ctrl+C to quit.", style="dim")
     return Group(table, status_line, footer)
 
 
