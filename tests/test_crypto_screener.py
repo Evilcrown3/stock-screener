@@ -122,3 +122,99 @@ def test_best_spread_ranks_by_net_not_gross():
     # Best gross is CB->KRK / BIN->KRK (+1.0%), but BIN->BST nets more: 0.8 - 0.02 - 0.40
     assert (b[0], b[1]) == ("Binance.US", "Bitstamp")
     assert abs(b[5] - 0.38) < 1e-9
+
+
+def test_uniswap_feed_end_to_end_with_fake_node(monkeypatch):
+    """Drive run_uniswap against a fake RPC node: setup calls, a swap, then a new block."""
+    import asyncio
+    import json as _json
+
+    pools = {p[1]: p for p in cs.UNISWAP_POOLS}
+    decimals = {cs.WETH: 18, cs.USDC: 6, cs.WBTC: 8, cs.LINK: 18, cs.UNI: 18}
+    word = lambda n: f"{n:064x}"
+    addr_word = lambda a: "0x" + "0" * 24 + a[2:]
+    # token0/token1 per pool (real ordering: lower address first)
+    order = {a: sorted([ct, qt]) for a, (_, _, ct, qt) in pools.items()}
+    prices = {  # token0 priced in token1, human units
+        "0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640": 1 / 2000,   # USDC in WETH -> ETH $2000
+        "0x99ac8ca7087fa4a2a1fb6357269965a2014abc35": 60000,      # WBTC in USDC
+        "0xa6cc3c2531fdaa6ae1a3ca84c2855806728693e8": 0.005,      # LINK in WETH -> $10
+        "0x1d42064fc4beb5f8aaf85f4617ae8b3b5b8bd801": 0.0025,     # UNI in WETH -> $5
+    }
+
+    def sqrtp(pool):
+        t0, t1 = order[pool]
+        return sqrt_x96_for(prices[pool], decimals[t0], decimals[t1])
+
+    class FakeWS:
+        def __init__(self):
+            self.out = asyncio.Queue()
+            self.sent_notifications = False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def send(self, raw):
+            m = _json.loads(raw)
+            method, params = m["method"], m["params"]
+            if method == "eth_call":
+                to, data = params[0]["to"], params[0]["data"]
+                if data == cs.SEL_TOKEN0:
+                    res = addr_word(order[to][0])
+                elif data == cs.SEL_TOKEN1:
+                    res = addr_word(order[to][1])
+                elif data == cs.SEL_DECIMALS:
+                    res = "0x" + word(decimals[to])
+                elif data == cs.SEL_FEE:
+                    res = "0x" + word(500 if to.startswith("0x88e6") else 3000)
+                elif data == cs.SEL_SLOT0:
+                    res = "0x" + word(sqrtp(to)) + word(0) * 6
+                await self.out.put({"jsonrpc": "2.0", "id": m["id"], "result": res})
+            elif method == "eth_getBlockByNumber":
+                await self.out.put({"id": m["id"], "result": {"baseFeePerGas": hex(int(1.9e9))}})
+            elif method == "eth_subscribe":
+                sub = "0xlogs" if params[0] == "logs" else "0xheads"
+                await self.out.put({"id": m["id"], "result": sub})
+                if sub == "0xheads":
+                    # a LINK swap moving it to 0.006 WETH, then a new block
+                    prices["0xa6cc3c2531fdaa6ae1a3ca84c2855806728693e8"] = 0.006
+                    link = "0xa6cc3c2531fdaa6ae1a3ca84c2855806728693e8"
+                    data = "0x" + word(1) + word(2) + word(sqrtp(link)) + word(3) + word(4)
+                    await self.out.put({"method": "eth_subscription", "params": {
+                        "subscription": "0xlogs", "result": {"address": link, "data": data, "removed": False}}})
+                    await self.out.put({"method": "eth_subscription", "params": {
+                        "subscription": "0xheads", "result": {"baseFeePerGas": hex(int(2.9e9))}}})
+
+        async def recv(self):
+            return _json.dumps(await self.out.get())
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            return await self.recv()
+
+    monkeypatch.setattr(cs.websockets, "connect", lambda *a, **k: FakeWS())
+    for c in cs.COINS:
+        cs.quotes[c].pop("Uniswap", None)
+
+    async def run():
+        task = asyncio.create_task(cs.run_uniswap("wss://fake"))
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            if cs.status["Uniswap"].startswith("live ("):
+                break
+        task.cancel()
+
+    asyncio.run(run())
+    assert cs.status["Uniswap"] == "live (1 swaps)", cs.status["Uniswap"]
+    q = cs.quotes
+    assert abs(q["ETH"]["Uniswap"].mid - 2000) < 0.01
+    assert abs(q["BTC"]["Uniswap"].mid - 60000) < 1
+    assert abs(q["LINK"]["Uniswap"].mid - 12.0) < 1e-6    # 0.006 WETH * $2000, after the swap
+    assert abs(q["UNI"]["Uniswap"].mid - 5.0) < 1e-6
+    assert q["ETH"]["Uniswap"].bid < 2000 < q["ETH"]["Uniswap"].ask  # pool fee applied
+    assert cs.gas["base_fee_wei"] == int(2.9e9)                      # updated by newHeads

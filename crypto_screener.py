@@ -366,6 +366,7 @@ async def run_uniswap(ws_url):
                 heads_sub = await rpc.call("eth_subscribe", ["newHeads"])
                 status["Uniswap"] = "live"
                 backoff = 1
+                swaps = 0
                 async for raw in ws:
                     msg = json.loads(raw)
                     params = msg.get("params", {})
@@ -375,6 +376,11 @@ async def run_uniswap(ws_url):
                     if params.get("subscription") == heads_sub:
                         if result.get("baseFeePerGas"):
                             gas["base_fee_wei"] = int(result["baseFeePerGas"], 16)
+                        # A pool's price only moves when someone swaps, so a quiet pool's
+                        # last price is still its current price. Re-stamp the quotes every
+                        # block; they only go stale if blocks stop arriving (connection lost).
+                        publish_uniswap(pools)
+                        status["Uniswap"] = f"live ({swaps} swaps)"
                         continue
                     if params.get("subscription") != swaps_sub or result.get("removed"):
                         continue
@@ -383,6 +389,7 @@ async def run_uniswap(ws_url):
                     if pool:
                         pool.price_in_quote = pool_price_in_quote(pool, decode_swap_sqrt_price(log["data"]))
                         publish_uniswap(pools)
+                        swaps += 1
         except asyncio.CancelledError:
             raise
         except ValueError as e:      # bad pool config: don't hammer, show why
@@ -499,7 +506,7 @@ def build_view(alert_pct, venues):
     for v in venues:
         s = status[v]
         status_line.append(f"{SHORT[v]}: ", style="bold")
-        status_line.append(f"{s}  ", style="green" if s == "live" else "yellow")
+        status_line.append(f"{s}  ", style="green" if s.startswith("live") else "yellow")
     g = uniswap_gas_usd()
     gas_text = f"${g:,.2f}/swap" if g else "waiting"
     fees = " ".join(f"{CODE[v]} {TAKER_FEE_PCT[v]:g}%" for v in venues if v != "Uniswap")
