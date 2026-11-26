@@ -466,21 +466,22 @@ def net_pct(buy_v, sell_v, gross_pct, size_usd=None):
     return net
 
 
-def best_spread(coin_quotes, now=None):
+def best_spread(coin_quotes, now=None, size_usd=None):
     """
     Best "buy on A at A's ask, sell on B at B's bid" across different venues,
     ranked by NET spread (after fees and gas).
     Returns (buy_venue, sell_venue, buy_price, sell_price, gross_pct, net_pct) or None.
     """
     now = now or time.time()
-    fresh = {v: q for v, q in coin_quotes.items() if not is_stale(v, q, now)}
+    # dict() copy first: the web app reads quotes while feed threads write them
+    fresh = {v: q for v, q in dict(coin_quotes).items() if not is_stale(v, q, now)}
     best = None
     for buy_v, bq in fresh.items():
         for sell_v, sq in fresh.items():
             if buy_v == sell_v:
                 continue
             gross = (sq.bid - bq.ask) / bq.ask * 100
-            net = net_pct(buy_v, sell_v, gross)
+            net = net_pct(buy_v, sell_v, gross, size_usd)
             if best is None or net > best[5]:
                 best = (buy_v, sell_v, bq.ask, sq.bid, gross, net)
     return best
