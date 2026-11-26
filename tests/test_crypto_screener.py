@@ -221,3 +221,23 @@ def test_uniswap_feed_end_to_end_with_fake_node(monkeypatch):
     assert abs(q["UNI"]["Uniswap"].mid - 6.25) < 1e-6
     assert q["ETH"]["Uniswap"].bid < 2500 < q["ETH"]["Uniswap"].ask  # pool fee applied
     assert cs.gas["base_fee_wei"] == int(2.9e9)                      # updated by newHeads
+
+
+def test_narrow_terminal_hides_gross_and_nothing_is_cut_off():
+    from rich.console import Console
+    now = time.time()
+    cs.gas.update(base_fee_wei=0, eth_usd=0.0)
+    mids = {"BTC": 60422.0, "ETH": 1685.9, "SOL": 70.89, "LINK": 9.252, "UNI": 4.64}
+    for coin, m in mids.items():
+        cs.quotes[coin] = {v: cs.Quote(m * 0.9999, m * 1.0001, now) for v in cs.VENUES
+                           if not (coin == "SOL" and v == "Uniswap")}
+    for width in (72, 76):
+        console = Console(width=width, record=True)
+        console.print(cs.build_view(0.0, cs.VENUES, width))
+        out = console.export_text()
+        table = out.split("Coinbase: ")[0]
+        assert "…" not in table, out
+        assert "Gross" not in table and "Net" in table
+    console = Console(width=100, record=True)
+    console.print(cs.build_view(0.0, cs.VENUES, 100))
+    assert "Gross" in console.export_text()

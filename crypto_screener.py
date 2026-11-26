@@ -508,15 +508,21 @@ SHORT = {"Coinbase": "Coinbase", "Kraken": "Kraken", "Bitstamp": "Bitstamp",
 CODE = {"Coinbase": "CB", "Kraken": "KRK", "Bitstamp": "BST", "Binance.US": "BIN", "Uniswap": "UNI"}
 
 
-def build_view(alert_pct, venues):
+# Below this terminal width the Gross column is hidden so Net stays readable.
+COMPACT_WIDTH = 84
+
+
+def build_view(alert_pct, venues, width=None):
     now = time.time()
+    show_gross = width is None or width >= COMPACT_WIDTH
     table = Table(title=f"Crypto Arb Screener  ·  {datetime.now().strftime('%I:%M:%S %p')}",
                   title_justify="left", box=box.SIMPLE_HEAD, pad_edge=False, collapse_padding=True)
     table.add_column("Coin", style="bold", no_wrap=True)
     for v in venues:
         table.add_column(SHORT[v], justify="right", no_wrap=True)
     table.add_column("Buy→Sell", no_wrap=True)
-    table.add_column("Gross", justify="right", no_wrap=True)
+    if show_gross:
+        table.add_column("Gross", justify="right", no_wrap=True)
     table.add_column("Net", justify="right", no_wrap=True)
 
     for coin in COINS:
@@ -534,11 +540,12 @@ def build_view(alert_pct, venues):
         if b:
             buy_v, sell_v, buy_p, sell_p, gross, net = b
             style = "bold black on green" if net >= alert_pct else "red"
-            row += [f"{CODE[buy_v]}→{CODE[sell_v]}",
-                    Text(f"{gross:+.2f}%", style="green" if gross > 0 else "dim"),
-                    Text(f"{net:+.2f}%", style=style)]
+            row.append(f"{CODE[buy_v]}→{CODE[sell_v]}")
+            if show_gross:
+                row.append(Text(f"{gross:+.2f}%", style="green" if gross > 0 else "dim"))
+            row.append(Text(f"{net:+.2f}%", style=style))
         else:
-            row += [Text("need 2 venues", style="dim"), "", ""]
+            row += [Text("need 2 venues", style="dim")] + [""] * (2 if show_gross else 1)
         table.add_row(*row)
 
     status_line = Text()
@@ -551,7 +558,8 @@ def build_view(alert_pct, venues):
     fees = " ".join(f"{CODE[v]} {TAKER_FEE_PCT[v]:g}%" for v in venues if v != "Uniswap")
     cost_line = Text(f"Trade size ${settings['size_usd']:,.0f} · Uniswap gas {gas_text} · Taker fees: {fees}",
                      style="cyan")
-    footer = Text(f"Net = gross − taker fees − gas. Green when net ≥ {alert_pct}%. Struck-out = stale. "
+    hidden = "" if show_gross else " (Gross hidden: widen the terminal to see it)"
+    footer = Text(f"Net = gross − taker fees − gas{hidden}. Green when net ≥ {alert_pct}%. Struck-out = stale. "
                   "CB=Coinbase KRK=Kraken BST=Bitstamp BIN=Binance.US UNI=Uniswap. Ctrl+C to quit.", style="dim")
     return Group(table, status_line, cost_line, footer)
 
@@ -622,11 +630,12 @@ async def main(args):
     log = AlertLog(None if args.no_log else args.log)
     running = [asyncio.create_task(t) for t in tasks]
     try:
-        with Live(build_view(args.alert, venues), console=Console(), refresh_per_second=REFRESH_PER_SECOND,
-                  screen=False) as live:
+        console = Console()
+        with Live(build_view(args.alert, venues, console.width), console=console,
+                  refresh_per_second=REFRESH_PER_SECOND, screen=False) as live:
             while True:
                 await asyncio.sleep(1 / REFRESH_PER_SECOND)
-                live.update(build_view(args.alert, venues))
+                live.update(build_view(args.alert, venues, console.width))
                 log.check(args.alert)
     finally:
         for t in running:
