@@ -305,22 +305,42 @@ def publish_uniswap(pools):
 
 
 class Rpc:
-    """Minimal JSON-RPC over one WebSocket (requests before subscribing)."""
+    """
+    Minimal JSON-RPC over one WebSocket. A background reader routes replies to
+    the call waiting for them and puts subscription events on `notifications`,
+    so we can make calls (e.g. read a pool's price) while subscribed.
+    """
 
     def __init__(self, ws):
         self.ws = ws
         self.next_id = 0
+        self.pending = {}
+        self.notifications = asyncio.Queue()
+
+    async def read_forever(self):
+        try:
+            async for raw in self.ws:
+                msg = json.loads(raw)
+                fut = self.pending.pop(msg.get("id"), None)
+                if fut and not fut.done():
+                    if "error" in msg:
+                        fut.set_exception(RuntimeError(msg["error"]))
+                    else:
+                        fut.set_result(msg.get("result"))
+                elif msg.get("method") == "eth_subscription":
+                    self.notifications.put_nowait(msg.get("params", {}))
+        finally:
+            for fut in self.pending.values():
+                if not fut.done():
+                    fut.set_exception(ConnectionError("connection closed"))
+            self.notifications.put_nowait(None)  # wake the main loop so it reconnects
 
     async def call(self, method, params):
         self.next_id += 1
-        my_id = self.next_id
-        await self.ws.send(json.dumps({"jsonrpc": "2.0", "id": my_id, "method": method, "params": params}))
-        while True:
-            msg = json.loads(await asyncio.wait_for(self.ws.recv(), timeout=20))
-            if msg.get("id") == my_id:
-                if "error" in msg:
-                    raise RuntimeError(msg["error"])
-                return msg["result"]
+        fut = asyncio.get_running_loop().create_future()
+        self.pending[self.next_id] = fut
+        await self.ws.send(json.dumps({"jsonrpc": "2.0", "id": self.next_id, "method": method, "params": params}))
+        return await asyncio.wait_for(fut, timeout=20)
 
     async def eth_call(self, to, data):
         return await self.call("eth_call", [{"to": to, "data": data}, "latest"])
@@ -335,6 +355,11 @@ def _addr(hex_result):
     return "0x" + _word(hex_result)[-40:]
 
 
+async def read_pool_price(rpc, pool):
+    slot0 = await rpc.eth_call(pool.address, SEL_SLOT0)
+    pool.price_in_quote = pool_price_in_quote(pool, int(_word(slot0, 0), 16))
+
+
 async def load_pool(rpc, pool):
     t0 = _addr(await rpc.eth_call(pool.address, SEL_TOKEN0)).lower()
     t1 = _addr(await rpc.eth_call(pool.address, SEL_TOKEN1)).lower()
@@ -344,19 +369,28 @@ async def load_pool(rpc, pool):
     pool.dec0 = int(await rpc.eth_call(t0, SEL_DECIMALS), 16)
     pool.dec1 = int(await rpc.eth_call(t1, SEL_DECIMALS), 16)
     pool.fee = int(await rpc.eth_call(pool.address, SEL_FEE), 16) / 1_000_000
-    slot0 = await rpc.eth_call(pool.address, SEL_SLOT0)
-    pool.price_in_quote = pool_price_in_quote(pool, int(_word(slot0, 0), 16))
+    await read_pool_price(rpc, pool)
 
 
 async def run_uniswap(ws_url):
+    """
+    Prices come from two sources:
+      1. Swap events (instant, when the RPC provider delivers them).
+      2. On every new block, any pool that had no swap event since the last block
+         gets its price read directly from the chain (slot0). This keeps prices
+         correct even if the provider doesn't deliver swap events (some free
+         public endpoints don't), and costs nothing extra for pools that did swap.
+    """
     pools = [Pool(coin, addr.lower(), ct, qt) for coin, addr, ct, qt in UNISWAP_POOLS]
     by_address = {p.address: p for p in pools}
     backoff = 1
     while True:
+        reader = None
         try:
             status["Uniswap"] = "connecting"
             async with websockets.connect(ws_url, ping_interval=20, max_size=2**22) as ws:
                 rpc = Rpc(ws)
+                reader = asyncio.create_task(rpc.read_forever())
                 for p in pools:
                     await load_pool(rpc, p)
                 publish_uniswap(pools)
@@ -367,29 +401,31 @@ async def run_uniswap(ws_url):
                 status["Uniswap"] = "live"
                 backoff = 1
                 swaps = 0
-                async for raw in ws:
-                    msg = json.loads(raw)
-                    params = msg.get("params", {})
+                swapped = set()  # pools with a swap event since the last block
+                while True:
+                    # No block for 60s means the connection is dead: reconnect.
+                    params = await asyncio.wait_for(rpc.notifications.get(), timeout=60)
+                    if params is None:
+                        raise ConnectionError("connection closed")
                     result = params.get("result")
                     if not isinstance(result, dict):
                         continue
                     if params.get("subscription") == heads_sub:
                         if result.get("baseFeePerGas"):
                             gas["base_fee_wei"] = int(result["baseFeePerGas"], 16)
-                        # A pool's price only moves when someone swaps, so a quiet pool's
-                        # last price is still its current price. Re-stamp the quotes every
-                        # block; they only go stale if blocks stop arriving (connection lost).
-                        publish_uniswap(pools)
+                        for p in pools:
+                            if p.address not in swapped:
+                                await read_pool_price(rpc, p)
+                        swapped.clear()
+                        publish_uniswap(pools)  # also re-stamps quotes, so they stay fresh
                         status["Uniswap"] = f"live ({swaps} swaps)"
-                        continue
-                    if params.get("subscription") != swaps_sub or result.get("removed"):
-                        continue
-                    log = result
-                    pool = by_address.get(log.get("address", "").lower())
-                    if pool:
-                        pool.price_in_quote = pool_price_in_quote(pool, decode_swap_sqrt_price(log["data"]))
-                        publish_uniswap(pools)
-                        swaps += 1
+                    elif params.get("subscription") == swaps_sub and not result.get("removed"):
+                        pool = by_address.get(result.get("address", "").lower())
+                        if pool:
+                            pool.price_in_quote = pool_price_in_quote(pool, decode_swap_sqrt_price(result["data"]))
+                            publish_uniswap(pools)
+                            swapped.add(pool.address)
+                            swaps += 1
         except asyncio.CancelledError:
             raise
         except ValueError as e:      # bad pool config: don't hammer, show why
@@ -397,6 +433,9 @@ async def run_uniswap(ws_url):
             backoff = 60
         except Exception as e:
             status["Uniswap"] = f"retry in {backoff}s ({type(e).__name__})"
+        finally:
+            if reader:
+                reader.cancel()
         await asyncio.sleep(backoff)
         backoff = min(backoff * 2, 60)
 

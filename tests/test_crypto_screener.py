@@ -185,6 +185,9 @@ def test_uniswap_feed_end_to_end_with_fake_node(monkeypatch):
                     data = "0x" + word(1) + word(2) + word(sqrtp(link)) + word(3) + word(4)
                     await self.out.put({"method": "eth_subscription", "params": {
                         "subscription": "0xlogs", "result": {"address": link, "data": data, "removed": False}}})
+                    # ETH moves to $2500 with NO swap event delivered (like a provider
+                    # that drops log events); polling on the next block must catch it.
+                    prices["0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640"] = 1 / 2500
                     await self.out.put({"method": "eth_subscription", "params": {
                         "subscription": "0xheads", "result": {"baseFeePerGas": hex(int(2.9e9))}}})
 
@@ -212,9 +215,9 @@ def test_uniswap_feed_end_to_end_with_fake_node(monkeypatch):
     asyncio.run(run())
     assert cs.status["Uniswap"] == "live (1 swaps)", cs.status["Uniswap"]
     q = cs.quotes
-    assert abs(q["ETH"]["Uniswap"].mid - 2000) < 0.01
+    assert abs(q["ETH"]["Uniswap"].mid - 2500) < 0.01     # picked up by per-block polling
     assert abs(q["BTC"]["Uniswap"].mid - 60000) < 1
-    assert abs(q["LINK"]["Uniswap"].mid - 12.0) < 1e-6    # 0.006 WETH * $2000, after the swap
-    assert abs(q["UNI"]["Uniswap"].mid - 5.0) < 1e-6
-    assert q["ETH"]["Uniswap"].bid < 2000 < q["ETH"]["Uniswap"].ask  # pool fee applied
+    assert abs(q["LINK"]["Uniswap"].mid - 15.0) < 1e-6    # 0.006 WETH (from the swap) * $2500
+    assert abs(q["UNI"]["Uniswap"].mid - 6.25) < 1e-6
+    assert q["ETH"]["Uniswap"].bid < 2500 < q["ETH"]["Uniswap"].ask  # pool fee applied
     assert cs.gas["base_fee_wei"] == int(2.9e9)                      # updated by newHeads
