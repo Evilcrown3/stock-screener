@@ -44,4 +44,18 @@ venues).
 Net spreads at or above `--alert` (default 0 = any profit) are appended to `arb_alerts.csv`
 (turn off with `--no-log`).
 
+### Phone / web version
+
+`crypto_app.py` is the same screener as a web page with one card per coin, which fits a
+phone screen. Run it locally with `streamlit run crypto_app.py`, or host it free on
+[Streamlit Community Cloud](https://share.streamlit.io) so it runs without your computer:
+
+1. share.streamlit.io → **Create app** → repo `Evilcrown3/stock-screener`, branch `main`,
+   main file `crypto_app.py` → **Deploy**.
+2. Optional: app **Settings → Secrets**, add `ETH_WS_URL = "wss://..."` (your Alchemy URL).
+3. On your phone, open the app's URL in Chrome → **⋮** → **Add to Home screen**.
+
+Free Streamlit apps go to sleep after a long stretch with no visitors; opening the page
+wakes them up (takes about a minute).
+
 Tests: `python -m pytest tests`
